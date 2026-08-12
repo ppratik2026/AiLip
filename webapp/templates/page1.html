@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}Image → Video · AiLip{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div class="page-badge">Step 1 of 2</div>
+  <h1 class="page-title">Image <span class="grad">→</span> Video</h1>
+  <p class="page-subtitle">Upload a face image and describe how to animate it. We'll generate a smooth video using the Ken Burns effect.</p>
+</div>
+
+<div class="card-grid">
+
+  <!-- ── Left: Upload + Form ──────────────────────────────────────────────── -->
+  <div class="card">
+    <h2 class="card-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+      Upload Image
+    </h2>
+
+    <div class="drop-zone" id="imgDropZone" data-accept="image">
+      <div class="drop-icon">🖼️</div>
+      <p class="drop-label">Drag & drop your image here</p>
+      <p class="drop-sub">or click to browse · JPG, PNG, WEBP</p>
+      <input type="file" id="imgInput" accept="image/jpeg,image/png,image/webp,image/bmp" hidden />
+    </div>
+
+    <div class="file-preview" id="imgPreview" style="display:none">
+      <img id="imgPreviewEl" alt="preview" />
+      <button class="btn-clear" id="imgClear" title="Remove">✕</button>
+    </div>
+
+    <div class="form-group mt-24">
+      <label class="form-label" for="prompt">
+        Animation Prompt
+        <span class="form-hint">Describe how to animate the image</span>
+      </label>
+      <textarea
+        id="prompt"
+        class="form-textarea"
+        rows="3"
+        placeholder="e.g. zoom in slowly, zoom out, pan right, pan left, still (no movement)"
+      ></textarea>
+      <div class="prompt-chips" id="promptChips">
+        <button class="chip" data-value="zoom in slowly">zoom in</button>
+        <button class="chip" data-value="zoom out slowly">zoom out</button>
+        <button class="chip" data-value="pan right gently">pan right</button>
+        <button class="chip" data-value="pan left gently">pan left</button>
+        <button class="chip" data-value="still no movement">still</button>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="duration">
+        Duration
+        <span class="form-hint" id="durationLabel">5 seconds</span>
+      </label>
+      <input type="range" id="duration" class="slider" min="2" max="30" value="5" step="1" />
+      <div class="slider-ticks"><span>2s</span><span>10s</span><span>20s</span><span>30s</span></div>
+    </div>
+
+    <button class="btn-primary" id="generateBtn" disabled>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      Generate Video
+    </button>
+  </div>
+
+  <!-- ── Right: Progress + Result ─────────────────────────────────────────── -->
+  <div class="card">
+    <h2 class="card-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+      Result
+    </h2>
+
+    <!-- Idle state -->
+    <div class="result-idle" id="resultIdle">
+      <div class="idle-icon">✨</div>
+      <p>Upload an image and click <strong>Generate Video</strong> to begin.</p>
+    </div>
+
+    <!-- Progress state -->
+    <div class="result-progress" id="resultProgress" style="display:none">
+      <div class="progress-wrap">
+        <div class="progress-bar" id="progressBar" style="width:0%"></div>
+      </div>
+      <p class="progress-msg" id="progressMsg">Starting…</p>
+      <div class="spinner" id="spinner"></div>
+    </div>
+
+    <!-- Done state -->
+    <div class="result-done" id="resultDone" style="display:none">
+      <div class="done-badge">✅ Done!</div>
+      <video id="resultVideo" controls playsinline></video>
+      <div class="result-actions">
+        <a class="btn-download" id="downloadBtn" href="#" download>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Download Video
+        </a>
+        <a class="btn-secondary" href="/lipsync">
+          Continue to Lipsync →
+        </a>
+      </div>
+    </div>
+
+    <!-- Error state -->
+    <div class="result-error" id="resultError" style="display:none">
+      <div class="error-icon">❌</div>
+      <p class="error-msg" id="errorMsg"></p>
+      <button class="btn-secondary" id="retryBtn">Try Again</button>
+    </div>
+  </div>
+
+</div><!-- .card-grid -->
+{% endblock %}
+
+{% block scripts %}
+<script>
+initPage1();
+</script>
+{% endblock %}
