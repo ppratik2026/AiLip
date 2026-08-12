@@ -20,10 +20,17 @@ from pathlib import Path
 PIPELINE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(PIPELINE_DIR))
 
-# ── Demo mode & ffmpeg resolution ─────────────────────────────────────────────
-# DEMO_MODE=1 skips GPU-heavy steps (LatentSync / CodeFormer / Real-ESRGAN).
-# The full UI flow (upload → progress → download) still works end-to-end.
-DEMO_MODE = os.environ.get("AILIP_DEMO", "0") == "1"
+# ── Mode flags ─────────────────────────────────────────────────────────────────
+# DEMO_MODE=1       → skip GPU steps entirely (for Hostinger / no-GPU servers)
+# GPU_WORKER_URL    → forward GPU jobs to a remote worker API
+#                     e.g. http://12.34.56.78:8000  (your RunPod/Vast.ai server)
+# WORKER_API_KEY    → shared secret sent in X-API-Key header to the worker
+DEMO_MODE      = os.environ.get("AILIP_DEMO", "0") == "1"
+GPU_WORKER_URL = os.environ.get("GPU_WORKER_URL", "").rstrip("/")
+WORKER_API_KEY = os.environ.get("WORKER_API_KEY", "")
+
+# If a GPU worker is configured, use it (overrides demo mode for GPU steps)
+USE_REMOTE_GPU = bool(GPU_WORKER_URL)
 
 
 def _resolve_ffmpeg() -> str:
@@ -301,8 +308,14 @@ def _run_img2vid(
         # ── Step 3: Lipsync (only when dialogue given) ─────────────────────
         if has_dialogue:
             output_path = job_dir / "output.mp4"
-            if DEMO_MODE:
-                # Demo: skip lipsync model — just mux TTS audio onto animation
+            if USE_REMOTE_GPU:
+                # Send animated video + TTS audio to GPU worker for lipsync
+                update_job(job_id, progress=48, message="Sending to GPU worker for lipsync…")
+                _remote_gpu_pipeline(
+                    job_id, animated_path, audio_path, output_path,
+                    model="auto", no_enhance=True, no_upscale=True,
+                )
+            elif DEMO_MODE:
                 update_job(job_id, progress=60, message="[DEMO] Merging audio (no lipsync model)…")
                 _demo_merge_av(animated_path, audio_path, output_path)
                 update_job(job_id, progress=90, message="[DEMO] Done merging.")
@@ -339,6 +352,122 @@ def _run_img2vid(
         update_job(job_id, status="error", progress=0, message=str(exc), error=str(exc))
 
 
+# ── Remote GPU Worker helpers ──────────────────────────────────────────────────
+
+def _worker_headers() -> dict:
+    h = {}
+    if WORKER_API_KEY:
+        h["X-API-Key"] = WORKER_API_KEY
+    return h
+
+
+def _remote_gpu_pipeline(
+    job_id: str,
+    source_path: Path,
+    audio_path: Path,
+    output_path: Path,
+    model: str = "auto",
+    no_enhance: bool = False,
+    no_upscale: bool = False,
+):
+    """
+    Send source + audio to the remote GPU worker, poll until done,
+    download the result to output_path. Updates job progress along the way.
+    """
+    import time
+    try:
+        import requests
+    except ImportError:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "requests", "-q"], check=True
+        )
+        import requests
+
+    # ── 1. Upload files to GPU worker ──────────────────────────────────────
+    update_job(job_id, progress=15, message="Uploading to GPU worker…")
+
+    with open(source_path, "rb") as sf, open(audio_path, "rb") as af:
+        resp = requests.post(
+            f"{GPU_WORKER_URL}/process",
+            headers=_worker_headers(),
+            files={
+                "source": (source_path.name, sf, "application/octet-stream"),
+                "audio":  (audio_path.name,  af, "application/octet-stream"),
+            },
+            data={
+                "model":      model,
+                "no_enhance": str(no_enhance).lower(),
+                "no_upscale": str(no_upscale).lower(),
+            },
+            timeout=120,
+        )
+    resp.raise_for_status()
+    worker_jid = resp.json()["job_id"]
+
+    update_job(job_id, progress=20, message="Job queued on GPU worker…")
+
+    # ── 2. Poll GPU worker for status ──────────────────────────────────────
+    step_msgs = {
+        "Converting": (22, "Animating image on GPU worker…"),
+        "Lipsync":    (35, "Lipsync model running on GPU…"),
+        "Enhancing":  (60, "Enhancing faces (CodeFormer)…"),
+        "Upscaling":  (78, "Upscaling to 2K (Real-ESRGAN)…"),
+        "Merging":    (90, "Merging audio…"),
+    }
+    poll_interval = 3.0
+    while True:
+        time.sleep(poll_interval)
+        poll_interval = min(poll_interval * 1.2, 10.0)  # slow down over time
+
+        r = requests.get(
+            f"{GPU_WORKER_URL}/job/{worker_jid}",
+            headers=_worker_headers(),
+            timeout=30,
+        )
+        r.raise_for_status()
+        wjob = r.json()
+
+        status = wjob.get("status", "")
+        msg    = wjob.get("message", "")
+        pct    = wjob.get("progress", 0)
+
+        # Map worker progress to our local progress range (20–92)
+        local_pct = 20 + int(pct * 0.72)
+        for keyword, (mapped_pct, mapped_msg) in step_msgs.items():
+            if keyword.lower() in msg.lower():
+                local_pct, msg = mapped_pct, mapped_msg
+                break
+        update_job(job_id, progress=local_pct, message=msg)
+
+        if status == "done":
+            break
+        if status == "error":
+            raise RuntimeError(f"GPU worker error: {wjob.get('error', 'unknown')}")
+
+    # ── 3. Download result ─────────────────────────────────────────────────
+    update_job(job_id, progress=93, message="Downloading result from GPU worker…")
+    r = requests.get(
+        f"{GPU_WORKER_URL}/download/{worker_jid}",
+        headers=_worker_headers(),
+        stream=True,
+        timeout=300,
+    )
+    r.raise_for_status()
+    with open(output_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            f.write(chunk)
+
+    # ── 4. Cleanup remote job ──────────────────────────────────────────────
+    try:
+        requests.delete(
+            f"{GPU_WORKER_URL}/cleanup/{worker_jid}",
+            headers=_worker_headers(),
+            timeout=15,
+        )
+    except Exception:
+        pass  # cleanup failure is non-fatal
+
+
 # ── Lipsync worker ─────────────────────────────────────────────────────────────
 
 def _run_lipsync(
@@ -358,39 +487,43 @@ def _run_lipsync(
             _text_to_speech(dialogue_text, str(audio_path))
 
         output_path = job_dir / "output_2k.mp4"
-        pipeline_script = PIPELINE_DIR / "pipeline.py"
 
-        cmd = [
-            sys.executable, str(pipeline_script),
-            "--source", str(video_path),
-            "--audio", str(audio_path),
-            "--output", str(output_path),
-            "--model", model,
-        ]
-        if no_enhance:
-            cmd.append("--no-enhance")
-        if no_upscale:
-            cmd.append("--no-upscale")
+        if USE_REMOTE_GPU:
+            # ── Remote GPU worker ──────────────────────────────────────────
+            update_job(job_id, status="running", progress=12, message="Connecting to GPU worker…")
+            _remote_gpu_pipeline(
+                job_id, video_path, audio_path, output_path,
+                model=model, no_enhance=no_enhance, no_upscale=no_upscale,
+            )
 
-        if DEMO_MODE:
-            # Demo mode: skip LatentSync/CodeFormer/Real-ESRGAN
-            # Just mux audio onto the uploaded video so the full UI flow is testable
+        elif DEMO_MODE:
+            # ── Demo mode (no GPU anywhere) ────────────────────────────────
             update_job(job_id, status="running", progress=20, message="[DEMO] Merging audio onto video…")
             _demo_merge_av(video_path, audio_path, output_path)
             update_job(job_id, progress=60, message="[DEMO] Skipped lipsync model.")
             update_job(job_id, progress=80, message="[DEMO] Skipped CodeFormer enhance.")
             update_job(job_id, progress=95, message="[DEMO] Skipped Real-ESRGAN upscale.")
+
         else:
+            # ── Local GPU pipeline ─────────────────────────────────────────
             update_job(job_id, status="running", progress=15, message="Starting pipeline…")
+            pipeline_script = PIPELINE_DIR / "pipeline.py"
+            cmd = [
+                sys.executable, str(pipeline_script),
+                "--source", str(video_path),
+                "--audio",  str(audio_path),
+                "--output", str(output_path),
+                "--model",  model,
+            ]
+            if no_enhance:
+                cmd.append("--no-enhance")
+            if no_upscale:
+                cmd.append("--no-upscale")
 
             proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=str(PIPELINE_DIR),
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=str(PIPELINE_DIR),
             )
-
             step_progress = {"[1/4]": 25, "[2/4]": 55, "[3/4]": 75, "[4/4]": 92}
             step_msgs = {
                 "[1/4]": "Lipsync model running…",
@@ -402,7 +535,6 @@ def _run_lipsync(
                 for tag, pct in step_progress.items():
                     if tag in line:
                         update_job(job_id, progress=pct, message=step_msgs[tag])
-
             proc.wait()
             if proc.returncode != 0:
                 raise RuntimeError(
