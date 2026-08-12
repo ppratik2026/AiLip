@@ -95,7 +95,7 @@ def main():
         sys.exit(1)
 
     require_tool("ffmpeg")
-    require_tool("ffprobe")
+    # ffprobe is used when available; utils.py falls back to ffmpeg stderr parsing otherwise
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
