@@ -26,6 +26,13 @@
     </div>
   </nav>
 
+  <!-- ── Demo mode banner ─────────────────────────────────────────────────── -->
+  {% if demo_mode %}
+  <div class="demo-banner">
+    ⚡ <strong>Demo Mode</strong> — Lipsync model skipped (audio-mux only). Run <code>bash setup.sh</code> for full GPU pipeline.
+  </div>
+  {% endif %}
+
   <!-- ── Main content ─────────────────────────────────────────────────────── -->
   <main class="main">
     {% block content %}{% endblock %}

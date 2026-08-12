@@ -7,7 +7,9 @@ Page 2 — Lipsync     (Video + Audio/Text → 2K lipsynced output)
 
 from flask import Flask, render_template, request, jsonify, send_file, abort
 import os
+import re
 import sys
+import shutil
 import uuid
 import threading
 import subprocess
@@ -18,8 +20,44 @@ from pathlib import Path
 PIPELINE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(PIPELINE_DIR))
 
+# ── Demo mode & ffmpeg resolution ─────────────────────────────────────────────
+# DEMO_MODE=1 skips GPU-heavy steps (LatentSync / CodeFormer / Real-ESRGAN).
+# The full UI flow (upload → progress → download) still works end-to-end.
+DEMO_MODE = os.environ.get("AILIP_DEMO", "0") == "1"
+
+
+def _resolve_ffmpeg() -> str:
+    """Return a working ffmpeg binary path.
+
+    Priority: AILIP_FFMPEG_BIN env → system ffmpeg → imageio-ffmpeg bundle.
+    """
+    custom = os.environ.get("AILIP_FFMPEG_BIN", "").strip()
+    if custom and Path(custom).is_file():
+        return custom
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    try:
+        import imageio_ffmpeg  # pip install imageio-ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "ffmpeg not found.\n"
+        "  Option A (system): sudo apt install ffmpeg\n"
+        "  Option B (pip):    pip install imageio-ffmpeg\n"
+        "  Option C (demo):   python run_demo.py"
+    )
+
+
+FFMPEG_BIN = _resolve_ffmpeg()
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB
+
+
+@app.context_processor
+def inject_globals():
+    return {"demo_mode": DEMO_MODE}
 
 JOBS_DIR = Path(tempfile.gettempdir()) / "ailip_jobs"
 JOBS_DIR.mkdir(exist_ok=True)
@@ -58,39 +96,87 @@ def _safe_ext(filename: str, allowed: set) -> str:
     return ext if ext in allowed else list(allowed)[0]
 
 
+def _demo_sine_wav(text: str, output_wav: str):
+    """Generate a placeholder WAV (sine tone) for demo mode when TTS has no internet."""
+    import math, wave, struct
+    # Estimate duration from word count (2.3 wps)
+    words    = len(text.split())
+    duration = max(3.0, words / 2.3)
+    rate     = 22050
+    freq     = 220.0   # Hz
+    samples  = int(rate * duration)
+    with wave.open(output_wav, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        for i in range(samples):
+            # Fade in/out to avoid clicks
+            fade  = min(1.0, min(i, samples - i) / (rate * 0.05))
+            val   = int(fade * 3000 * math.sin(2 * math.pi * freq * i / rate))
+            wf.writeframes(struct.pack("<h", val))
+
+
 def _text_to_speech(text: str, output_wav: str):
-    """Convert text to WAV using gTTS → ffmpeg, falling back to pyttsx3."""
+    """Convert text to WAV.
+
+    Chain:
+      1. gTTS  (online, best quality)
+      2. pyttsx3 (offline, needs espeak)
+      3. Sine-wave placeholder (demo fallback, always works)
+    """
+    # 1. gTTS
     try:
         from gtts import gTTS
         tmp_mp3 = output_wav.replace(".wav", "_tmp.mp3")
         gTTS(text=text, lang="en").save(tmp_mp3)
         subprocess.run(
-            ["ffmpeg", "-y", "-i", tmp_mp3, output_wav],
+            [FFMPEG_BIN, "-y", "-i", tmp_mp3, output_wav],
             check=True, capture_output=True
         )
         os.remove(tmp_mp3)
-    except ImportError:
-        try:
-            import pyttsx3
-            engine = pyttsx3.init()
-            engine.save_to_file(text, output_wav)
-            engine.runAndWait()
-        except Exception:
-            raise RuntimeError(
-                "No TTS engine available. Install one: pip install gTTS"
-            )
+        return
+    except Exception:
+        pass
+
+    # 2. pyttsx3
+    try:
+        import pyttsx3
+        engine = pyttsx3.init()
+        engine.save_to_file(text, output_wav)
+        engine.runAndWait()
+        if Path(output_wav).exists():
+            return
+    except Exception:
+        pass
+
+    # 3. Demo fallback: sine-wave placeholder (no internet / no espeak needed)
+    if DEMO_MODE:
+        _demo_sine_wav(text, output_wav)
+        return
+
+    raise RuntimeError(
+        "No TTS engine available.\n"
+        "  Online: pip install gTTS  (needs internet)\n"
+        "  Offline: pip install pyttsx3 + sudo apt install espeak"
+    )
 
 
 def _get_audio_duration(audio_path: str) -> float:
-    """Return duration of audio file in seconds via ffprobe."""
-    import json as _json
+    """Return duration in seconds — uses ffmpeg stderr (no ffprobe needed)."""
+    # ffmpeg always prints Duration to stderr even with -i only
     result = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-of", "json",
-         "-show_entries", "format=duration", str(audio_path)],
-        capture_output=True, text=True,
+        [FFMPEG_BIN, "-i", str(audio_path)],
+        capture_output=True, text=True
     )
+    m = re.search(r"Duration:\s+(\d+):(\d+):([\d.]+)", result.stderr)
+    if m:
+        h, mi, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        return h * 3600 + mi * 60 + s
+    # Fallback: Python wave module (WAV files only)
     try:
-        return float(_json.loads(result.stdout)["format"]["duration"])
+        import wave
+        with wave.open(str(audio_path), "rb") as wf:
+            return wf.getnframes() / wf.getframerate()
     except Exception:
         return 8.0
 
@@ -124,23 +210,35 @@ def _build_animation_vf(style: str, frames: int) -> str:
 
 
 def _render_animated_video(image_path: Path, vf: str, duration: float, fps: int, output_path: Path):
-    fps_arg = str(fps)
-    if vf == "scale=1280:720":
-        # still image — no zoompan needed
-        cmd = [
-            "ffmpeg", "-y", "-loop", "1", "-i", str(image_path),
-            "-vf", vf, "-c:v", "libx264", "-t", str(duration),
-            "-pix_fmt", "yuv420p", "-r", fps_arg, str(output_path),
-        ]
-    else:
-        cmd = [
-            "ffmpeg", "-y", "-loop", "1", "-i", str(image_path),
-            "-vf", vf, "-c:v", "libx264", "-t", str(duration),
-            "-pix_fmt", "yuv420p", str(output_path),
-        ]
+    """Render a Ken Burns–style animation from a still image."""
+    cmd = [
+        FFMPEG_BIN, "-y", "-loop", "1", "-i", str(image_path),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-t", str(duration),
+        "-pix_fmt", "yuv420p",
+        str(output_path),
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg animation failed:\n{result.stderr[-600:]}")
+
+
+def _demo_merge_av(video_path: Path, audio_path: Path, output_path: Path):
+    """Demo-mode AV merge: mux audio onto video without any lipsync model."""
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-shortest",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg AV merge failed:\n{result.stderr[-400:]}")
 
 
 # ── Image-to-Video worker ──────────────────────────────────────────────────────
@@ -202,31 +300,36 @@ def _run_img2vid(
 
         # ── Step 3: Lipsync (only when dialogue given) ─────────────────────
         if has_dialogue:
-            update_job(job_id, progress=48, message="Running lipsync on animated video…")
             output_path = job_dir / "output.mp4"
-            pipeline_script = PIPELINE_DIR / "pipeline.py"
-
-            cmd = [
-                sys.executable, str(pipeline_script),
-                "--source", str(animated_path),
-                "--audio",  str(audio_path),
-                "--output", str(output_path),
-                "--model",  "auto",
-                "--no-enhance",   # keep Page 1 fast; user can enhance on Page 2
-                "--no-upscale",
-            ]
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, cwd=str(PIPELINE_DIR),
-            )
-            step_map = {"[1/4]": (60, "Lipsync model running…"), "[4/4]": (88, "Merging audio…")}
-            for line in proc.stdout:
-                for tag, (pct, msg) in step_map.items():
-                    if tag in line:
-                        update_job(job_id, progress=pct, message=msg)
-            proc.wait()
-            if proc.returncode != 0:
-                raise RuntimeError("Lipsync step failed. Run setup.sh to ensure models are downloaded.")
+            if DEMO_MODE:
+                # Demo: skip lipsync model — just mux TTS audio onto animation
+                update_job(job_id, progress=60, message="[DEMO] Merging audio (no lipsync model)…")
+                _demo_merge_av(animated_path, audio_path, output_path)
+                update_job(job_id, progress=90, message="[DEMO] Done merging.")
+            else:
+                update_job(job_id, progress=48, message="Running lipsync on animated video…")
+                pipeline_script = PIPELINE_DIR / "pipeline.py"
+                cmd = [
+                    sys.executable, str(pipeline_script),
+                    "--source", str(animated_path),
+                    "--audio",  str(audio_path),
+                    "--output", str(output_path),
+                    "--model",  "auto",
+                    "--no-enhance",
+                    "--no-upscale",
+                ]
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, cwd=str(PIPELINE_DIR),
+                )
+                step_map = {"[1/4]": (60, "Lipsync model running…"), "[4/4]": (88, "Merging audio…")}
+                for line in proc.stdout:
+                    for tag, (pct, msg) in step_map.items():
+                        if tag in line:
+                            update_job(job_id, progress=pct, message=msg)
+                proc.wait()
+                if proc.returncode != 0:
+                    raise RuntimeError("Lipsync step failed. Run setup.sh to ensure models are downloaded.")
         else:
             output_path = animated_path
 
@@ -269,33 +372,42 @@ def _run_lipsync(
         if no_upscale:
             cmd.append("--no-upscale")
 
-        update_job(job_id, status="running", progress=15, message="Starting pipeline…")
+        if DEMO_MODE:
+            # Demo mode: skip LatentSync/CodeFormer/Real-ESRGAN
+            # Just mux audio onto the uploaded video so the full UI flow is testable
+            update_job(job_id, status="running", progress=20, message="[DEMO] Merging audio onto video…")
+            _demo_merge_av(video_path, audio_path, output_path)
+            update_job(job_id, progress=60, message="[DEMO] Skipped lipsync model.")
+            update_job(job_id, progress=80, message="[DEMO] Skipped CodeFormer enhance.")
+            update_job(job_id, progress=95, message="[DEMO] Skipped Real-ESRGAN upscale.")
+        else:
+            update_job(job_id, status="running", progress=15, message="Starting pipeline…")
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            cwd=str(PIPELINE_DIR),
-        )
-
-        step_progress = {"[1/4]": 25, "[2/4]": 55, "[3/4]": 75, "[4/4]": 92}
-        step_msgs = {
-            "[1/4]": "Lipsync model running…",
-            "[2/4]": "Enhancing faces with CodeFormer…",
-            "[3/4]": "Upscaling to 2K with Real-ESRGAN…",
-            "[4/4]": "Merging audio…",
-        }
-        for line in proc.stdout:
-            for tag, pct in step_progress.items():
-                if tag in line:
-                    update_job(job_id, progress=pct, message=step_msgs[tag])
-
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                "Pipeline failed. Make sure setup.sh was run and all models are downloaded."
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(PIPELINE_DIR),
             )
+
+            step_progress = {"[1/4]": 25, "[2/4]": 55, "[3/4]": 75, "[4/4]": 92}
+            step_msgs = {
+                "[1/4]": "Lipsync model running…",
+                "[2/4]": "Enhancing faces with CodeFormer…",
+                "[3/4]": "Upscaling to 2K with Real-ESRGAN…",
+                "[4/4]": "Merging audio…",
+            }
+            for line in proc.stdout:
+                for tag, pct in step_progress.items():
+                    if tag in line:
+                        update_job(job_id, progress=pct, message=step_msgs[tag])
+
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    "Pipeline failed. Make sure setup.sh was run and all models are downloaded."
+                )
 
         update_job(job_id, status="done", progress=100, message="Lipsync complete!", output=str(output_path))
 
