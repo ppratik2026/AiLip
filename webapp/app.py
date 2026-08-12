@@ -81,86 +81,154 @@ def _text_to_speech(text: str, output_wav: str):
             )
 
 
+def _get_audio_duration(audio_path: str) -> float:
+    """Return duration of audio file in seconds via ffprobe."""
+    import json as _json
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-of", "json",
+         "-show_entries", "format=duration", str(audio_path)],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(_json.loads(result.stdout)["format"]["duration"])
+    except Exception:
+        return 8.0
+
+
+def _build_animation_vf(style: str, frames: int) -> str:
+    """Return ffmpeg -vf string for the requested Ken Burns style."""
+    if style == "zoom_in":
+        return (
+            f"zoompan=z='if(lte(on,1),1.0,min(1.4,zoom+0.0015))'"
+            f":d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',scale=1280:720"
+        )
+    if style == "zoom_out":
+        return (
+            f"zoompan=z='if(lte(on,1),1.4,max(1.0,zoom-0.0015))'"
+            f":d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',scale=1280:720"
+        )
+    if style == "pan_right":
+        return (
+            f"zoompan=z=1.3:d={frames}"
+            f":x='if(lte(on,1),0,min(iw*0.2,x+iw*0.2/{frames}))'"
+            f":y='ih/2-(ih/zoom/2)',scale=1280:720"
+        )
+    if style == "pan_left":
+        return (
+            f"zoompan=z=1.3:d={frames}"
+            f":x='if(lte(on,1),iw*0.2,max(0,x-iw*0.2/{frames}))'"
+            f":y='ih/2-(ih/zoom/2)',scale=1280:720"
+        )
+    # still / default
+    return "scale=1280:720"
+
+
+def _render_animated_video(image_path: Path, vf: str, duration: float, fps: int, output_path: Path):
+    fps_arg = str(fps)
+    if vf == "scale=1280:720":
+        # still image — no zoompan needed
+        cmd = [
+            "ffmpeg", "-y", "-loop", "1", "-i", str(image_path),
+            "-vf", vf, "-c:v", "libx264", "-t", str(duration),
+            "-pix_fmt", "yuv420p", "-r", fps_arg, str(output_path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-loop", "1", "-i", str(image_path),
+            "-vf", vf, "-c:v", "libx264", "-t", str(duration),
+            "-pix_fmt", "yuv420p", str(output_path),
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg animation failed:\n{result.stderr[-600:]}")
+
+
 # ── Image-to-Video worker ──────────────────────────────────────────────────────
 
-def _parse_animation(prompt: str) -> dict:
+MIN_DURATION = 8.0   # seconds — enforced minimum for all outputs
+WORDS_PER_SEC = 2.3  # average TTS speaking rate
+
+def _parse_animation(prompt: str) -> str:
+    """Return animation style key from prompt text."""
     p = prompt.lower()
-    style = "zoom_in"  # default
     if any(k in p for k in ["zoom in", "zoom-in", "close up", "closer"]):
-        style = "zoom_in"
-    elif any(k in p for k in ["zoom out", "zoom-out", "pull back", "wider"]):
-        style = "zoom_out"
-    elif any(k in p for k in ["pan right", "move right", "slide right"]):
-        style = "pan_right"
-    elif any(k in p for k in ["pan left", "move left", "slide left"]):
-        style = "pan_left"
-    elif any(k in p for k in ["still", "static", "no movement"]):
-        style = "still"
-
-    # Parse duration hint from prompt ("5 seconds", "10s", "3 sec")
-    import re
-    m = re.search(r"(\d+)\s*(?:sec|s\b)", p)
-    duration_hint = int(m.group(1)) if m else None
-
-    return {"style": style, "duration_hint": duration_hint}
+        return "zoom_in"
+    if any(k in p for k in ["zoom out", "zoom-out", "pull back", "wider"]):
+        return "zoom_out"
+    if any(k in p for k in ["pan right", "move right", "slide right"]):
+        return "pan_right"
+    if any(k in p for k in ["pan left", "move left", "slide left"]):
+        return "pan_left"
+    if any(k in p for k in ["still", "static", "no movement"]):
+        return "still"
+    return "zoom_in"
 
 
-def _run_img2vid(job_id: str, image_path: Path, prompt: str, duration: float, job_dir: Path):
+def _run_img2vid(
+    job_id: str,
+    image_path: Path,
+    prompt: str,
+    base_duration: float,
+    dialogues: list[str],   # list of dialogue strings (may be empty)
+    job_dir: Path,
+):
     try:
-        update_job(job_id, status="running", progress=10, message="Analyzing prompt…")
+        update_job(job_id, status="running", progress=5, message="Analyzing prompt…")
 
-        anim = _parse_animation(prompt)
-        if anim["duration_hint"]:
-            duration = float(anim["duration_hint"])
-        duration = max(2.0, min(30.0, duration))
-
+        has_dialogue = any(d.strip() for d in dialogues)
         fps = 25
+
+        # ── Step 1: TTS (if dialogue provided) ────────────────────────────
+        audio_path = None
+        if has_dialogue:
+            full_text = " ".join(d.strip() for d in dialogues if d.strip())
+            update_job(job_id, progress=12, message="Generating speech from dialogue…")
+            audio_path = job_dir / "dialogue.wav"
+            _text_to_speech(full_text, str(audio_path))
+            audio_dur  = _get_audio_duration(str(audio_path))
+            # 1 second padding after speech, enforce 8 s minimum
+            duration   = max(MIN_DURATION, audio_dur + 1.0)
+        else:
+            duration = max(MIN_DURATION, base_duration)
+
         frames = int(duration * fps)
-        style = anim["style"]
+        style  = _parse_animation(prompt)
+        vf     = _build_animation_vf(style, frames)
 
-        # Build zoompan ffmpeg filter for Ken Burns effect
-        if style == "zoom_in":
-            vf = (
-                f"zoompan=z='if(lte(on,1),1.0,min(1.4,zoom+0.0015))'"
-                f":d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',scale=1280:720"
-            )
-        elif style == "zoom_out":
-            vf = (
-                f"zoompan=z='if(lte(on,1),1.4,max(1.0,zoom-0.0015))'"
-                f":d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',scale=1280:720"
-            )
-        elif style == "pan_right":
-            vf = (
-                f"zoompan=z=1.3:d={frames}"
-                f":x='if(lte(on,1),0,min(iw*0.2,x+iw*0.2/{frames}))'"
-                f":y='ih/2-(ih/zoom/2)',scale=1280:720"
-            )
-        elif style == "pan_left":
-            vf = (
-                f"zoompan=z=1.3:d={frames}"
-                f":x='if(lte(on,1),iw*0.2,max(0,x-iw*0.2/{frames}))'"
-                f":y='ih/2-(ih/zoom/2)',scale=1280:720"
-            )
-        else:  # still
-            vf = f"scale=1280:720"
+        # ── Step 2: Render animation ───────────────────────────────────────
+        update_job(job_id, progress=28, message=f"Rendering {duration:.1f}s animated video…")
+        animated_path = job_dir / "animated.mp4"
+        _render_animated_video(image_path, vf, duration, fps, animated_path)
 
-        output_path = job_dir / "output.mp4"
-        update_job(job_id, progress=30, message="Rendering animated video…")
+        # ── Step 3: Lipsync (only when dialogue given) ─────────────────────
+        if has_dialogue:
+            update_job(job_id, progress=48, message="Running lipsync on animated video…")
+            output_path = job_dir / "output.mp4"
+            pipeline_script = PIPELINE_DIR / "pipeline.py"
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1",
-            "-i", str(image_path),
-            "-vf", vf,
-            "-c:v", "libx264",
-            "-t", str(duration),
-            "-pix_fmt", "yuv420p",
-            "-r", str(fps),
-            str(output_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed:\n{result.stderr[-600:]}")
+            cmd = [
+                sys.executable, str(pipeline_script),
+                "--source", str(animated_path),
+                "--audio",  str(audio_path),
+                "--output", str(output_path),
+                "--model",  "auto",
+                "--no-enhance",   # keep Page 1 fast; user can enhance on Page 2
+                "--no-upscale",
+            ]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=str(PIPELINE_DIR),
+            )
+            step_map = {"[1/4]": (60, "Lipsync model running…"), "[4/4]": (88, "Merging audio…")}
+            for line in proc.stdout:
+                for tag, (pct, msg) in step_map.items():
+                    if tag in line:
+                        update_job(job_id, progress=pct, message=msg)
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError("Lipsync step failed. Run setup.sh to ensure models are downloaded.")
+        else:
+            output_path = animated_path
 
         update_job(job_id, status="done", progress=100, message="Video ready!", output=str(output_path))
 
@@ -242,12 +310,15 @@ def api_img2vid():
     if "image" not in request.files or not request.files["image"].filename:
         return jsonify(error="No image uploaded"), 400
 
-    img_file = request.files["image"]
-    ext = _safe_ext(img_file.filename, ALLOWED_IMAGE)
-    prompt = request.form.get("prompt", "").strip()
-    duration = float(request.form.get("duration", 5))
+    img_file  = request.files["image"]
+    ext       = _safe_ext(img_file.filename, ALLOWED_IMAGE)
+    prompt    = request.form.get("prompt", "").strip()
+    duration  = float(request.form.get("duration", MIN_DURATION))
 
-    job_id = new_job()
+    # Accept multiple dialogue lines sent as dialogue[] or dialogue
+    dialogues = request.form.getlist("dialogue[]") or request.form.getlist("dialogue")
+
+    job_id  = new_job()
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir()
 
@@ -256,7 +327,7 @@ def api_img2vid():
 
     threading.Thread(
         target=_run_img2vid,
-        args=(job_id, image_path, prompt, duration, job_dir),
+        args=(job_id, image_path, prompt, duration, dialogues, job_dir),
         daemon=True,
     ).start()
 

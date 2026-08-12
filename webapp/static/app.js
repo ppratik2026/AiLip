@@ -73,16 +73,23 @@ function showState(states, name) {
    PAGE 1 — Image to Video
 ═══════════════════════════════════════════════════════════════════════════ */
 
+const WORDS_PER_SEC  = 2.3;   // average TTS speaking rate
+const MIN_DURATION   = 8;     // seconds
+
 function initPage1() {
-  const imgDropZone  = document.getElementById('imgDropZone');
-  const imgInput     = document.getElementById('imgInput');
-  const imgPreview   = document.getElementById('imgPreview');
-  const imgPreviewEl = document.getElementById('imgPreviewEl');
-  const imgClear     = document.getElementById('imgClear');
-  const promptEl     = document.getElementById('prompt');
-  const durationEl   = document.getElementById('duration');
-  const durationLbl  = document.getElementById('durationLabel');
-  const generateBtn  = document.getElementById('generateBtn');
+  const imgDropZone   = document.getElementById('imgDropZone');
+  const imgInput      = document.getElementById('imgInput');
+  const imgPreview    = document.getElementById('imgPreview');
+  const imgPreviewEl  = document.getElementById('imgPreviewEl');
+  const imgClear      = document.getElementById('imgClear');
+  const promptEl      = document.getElementById('prompt');
+  const generateBtn   = document.getElementById('generateBtn');
+  const generateLabel = document.getElementById('generateBtnLabel');
+  const addDialogBtn  = document.getElementById('addDialogueBtn');
+  const dialogueList  = document.getElementById('dialogueList');
+  const durationText  = document.getElementById('durationText');
+  const durationBar   = document.getElementById('durationBar');
+  const stepsInd      = document.getElementById('stepsIndicator');
 
   // Result panel
   const resultIdle     = document.getElementById('resultIdle');
@@ -95,66 +102,179 @@ function initPage1() {
   const downloadBtn    = document.getElementById('downloadBtn');
   const retryBtn       = document.getElementById('retryBtn');
   const errorMsg       = document.getElementById('errorMsg');
+  const resultMeta     = document.getElementById('resultMeta');
+
+  // Step dots for page 1
+  const p1step1 = document.getElementById('p1step1');
+  const p1step2 = document.getElementById('p1step2');
+  const p1step3 = document.getElementById('p1step3');
 
   const states = { idle: resultIdle, progress: resultProgress, done: resultDone, error: resultError };
 
-  let selectedFile = null;
+  let selectedFile  = null;
+  let rowCounter    = 0;
 
-  // Drop zone
+  // ── Image drop zone ──────────────────────────────────────────────────────
   initDropZone(imgDropZone, imgInput, file => {
     selectedFile = file;
-    const url = URL.createObjectURL(file);
-    imgPreviewEl.src = url;
+    imgPreviewEl.src = URL.createObjectURL(file);
     imgDropZone.style.display = 'none';
-    imgPreview.style.display = '';
-    updateGenerateBtn();
+    imgPreview.style.display  = '';
+    updateUI();
   });
 
-  // Clear image
   imgClear.addEventListener('click', () => {
     selectedFile = null;
     imgInput.value = '';
-    imgPreview.style.display = 'none';
+    imgPreview.style.display  = 'none';
     imgDropZone.style.display = '';
-    updateGenerateBtn();
+    updateUI();
   });
 
-  // Duration slider
-  durationEl.addEventListener('input', () => {
-    durationLbl.textContent = `${durationEl.value} seconds`;
-  });
-
-  // Prompt chips
+  // ── Prompt chips ─────────────────────────────────────────────────────────
   document.querySelectorAll('.chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      promptEl.value = chip.dataset.value;
-    });
+    chip.addEventListener('click', () => { promptEl.value = chip.dataset.value; });
   });
 
-  // Enable/disable generate button
-  function updateGenerateBtn() {
+  // ── Dialogue rows ─────────────────────────────────────────────────────────
+
+  function getDialogues() {
+    return Array.from(dialogueList.querySelectorAll('.dialogue-input'))
+                .map(el => el.value.trim())
+                .filter(Boolean);
+  }
+
+  function estimateDuration(dialogues) {
+    const allText = dialogues.join(' ');
+    const words   = allText.split(/\s+/).filter(Boolean).length;
+    if (!words) return MIN_DURATION;
+    return Math.max(MIN_DURATION, Math.ceil(words / WORDS_PER_SEC) + 1);
+  }
+
+  function updateDurationBar() {
+    const dialogues = getDialogues();
+    const hasDlg    = dialogues.length > 0;
+    const secs      = estimateDuration(dialogues);
+
+    durationBar.className = 'duration-bar' + (hasDlg ? ' has-dialogue' : '');
+
+    if (hasDlg) {
+      durationText.textContent =
+        `~${secs}s (${dialogues.join(' ').split(/\s+/).filter(Boolean).length} words · auto-lipsynced)`;
+      generateLabel.textContent = 'Generate + Lipsync';
+      stepsInd.style.display = '';
+    } else {
+      durationText.textContent = `Minimum ${MIN_DURATION} seconds (no dialogue)`;
+      generateLabel.textContent = 'Generate Video';
+      stepsInd.style.display = 'none';
+    }
+    updateUI();
+  }
+
+  function addDialogueRow(value = '') {
+    rowCounter++;
+    const row   = document.createElement('div');
+    row.className = 'dialogue-row';
+    row.dataset.id = rowCounter;
+
+    const num  = document.createElement('span');
+    num.className = 'dialogue-row-num';
+    num.textContent = dialogueList.children.length + 1;
+
+    const ta   = document.createElement('textarea');
+    ta.className   = 'dialogue-input';
+    ta.rows        = 2;
+    ta.placeholder = `Dialogue line ${dialogueList.children.length + 1}…`;
+    ta.value       = value;
+    // Auto-resize textarea
+    ta.addEventListener('input', () => {
+      ta.style.height = 'auto';
+      ta.style.height = ta.scrollHeight + 'px';
+      updateDurationBar();
+    });
+
+    const rmBtn = document.createElement('button');
+    rmBtn.className   = 'dialogue-remove';
+    rmBtn.type        = 'button';
+    rmBtn.title       = 'Remove';
+    rmBtn.textContent = '✕';
+    rmBtn.addEventListener('click', () => {
+      row.remove();
+      renumberRows();
+      updateDurationBar();
+    });
+
+    row.appendChild(num);
+    row.appendChild(ta);
+    row.appendChild(rmBtn);
+    dialogueList.appendChild(row);
+    ta.focus();
+    updateDurationBar();
+  }
+
+  function renumberRows() {
+    dialogueList.querySelectorAll('.dialogue-row').forEach((row, i) => {
+      row.querySelector('.dialogue-row-num').textContent = i + 1;
+      row.querySelector('.dialogue-input').placeholder = `Dialogue line ${i + 1}…`;
+    });
+  }
+
+  addDialogBtn.addEventListener('click', () => addDialogueRow());
+
+  // Add first empty row by default
+  addDialogueRow();
+
+  // ── Enable/disable generate button ────────────────────────────────────────
+  function updateUI() {
     generateBtn.disabled = !selectedFile;
   }
 
-  // Retry
+  // ── Steps helper ─────────────────────────────────────────────────────────
+  function setP1Steps(active) {
+    // active: 0=TTS, 1=Animate, 2=Lipsync, 3=done
+    [p1step1, p1step2, p1step3].forEach((el, i) => {
+      if (!el) return;
+      el.classList.remove('active', 'done');
+      if (i < active)  el.classList.add('done');
+      if (i === active) el.classList.add('active');
+    });
+    stepsInd.querySelectorAll('.step-line').forEach((line, i) => {
+      line.classList.toggle('done', i < active);
+    });
+  }
+
+  function progressToStep(pct) {
+    if (pct < 20)  setP1Steps(0);
+    else if (pct < 45) setP1Steps(1);
+    else if (pct < 90) setP1Steps(2);
+    else               setP1Steps(3);
+  }
+
+  // ── Retry ─────────────────────────────────────────────────────────────────
   if (retryBtn) retryBtn.addEventListener('click', () => {
     showState(states, 'idle');
-    updateGenerateBtn();
+    updateUI();
   });
 
-  // Generate
+  // ── Generate ─────────────────────────────────────────────────────────────
   generateBtn.addEventListener('click', () => {
     if (!selectedFile) return;
+
+    const dialogues    = getDialogues();
+    const hasDialogue  = dialogues.length > 0;
+    const estDuration  = estimateDuration(dialogues);
 
     const fd = new FormData();
     fd.append('image',    selectedFile);
     fd.append('prompt',   promptEl.value.trim());
-    fd.append('duration', durationEl.value);
+    fd.append('duration', estDuration);
+    dialogues.forEach(d => fd.append('dialogue[]', d));
 
     generateBtn.disabled = true;
     showState(states, 'progress');
-    progressBar.style.width = '5%';
+    progressBar.style.width = '4%';
     progressMsg.textContent = 'Uploading…';
+    if (hasDialogue) setP1Steps(0);
 
     fetch('/api/img2vid', { method: 'POST', body: fd })
       .then(r => r.json())
@@ -165,11 +285,18 @@ function initPage1() {
           (pct, msg) => {
             progressBar.style.width = pct + '%';
             progressMsg.textContent = msg;
+            if (hasDialogue) progressToStep(pct);
           },
           (jobId) => {
+            if (hasDialogue) setP1Steps(3);
             showState(states, 'done');
-            resultVideo.src = `/api/download/${jobId}`;
-            downloadBtn.href = `/api/download/${jobId}`;
+            resultVideo.src   = `/api/download/${jobId}`;
+            downloadBtn.href  = `/api/download/${jobId}`;
+            if (resultMeta) {
+              resultMeta.textContent = hasDialogue
+                ? `Animated + lipsynced · ~${estDuration}s`
+                : `Animated video · ~${estDuration}s`;
+            }
             generateBtn.disabled = false;
           },
           (err) => {
@@ -187,6 +314,7 @@ function initPage1() {
   });
 
   showState(states, 'idle');
+  updateDurationBar();
 }
 
 
