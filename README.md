@@ -1,0 +1,182 @@
+# AiLip — 2K Lipsync Pipeline
+
+Open-source pipeline that takes a face video/image + audio and outputs a **lipsynced 2560×1440 MP4** using state-of-the-art open models.
+
+```
+source video/image + audio
+        │
+        ▼
+  [1] LatentSync          ← lipsync (fallback: VideoReTalking if low VRAM)
+        │
+        ▼
+  [2] CodeFormer          ← face enhancement & restoration
+        │
+        ▼
+  [3] Real-ESRGAN         ← 4× upscale (video mode, temporal consistency)
+        │
+        ▼
+  [4] ffmpeg              ← final audio merge → output_2k.mp4 (2560×1440)
+```
+
+## Models Used
+
+| Step | Model | Purpose |
+|---|---|---|
+| Lipsync (primary) | [LatentSync](https://github.com/bytedance/LatentSync) | Latent diffusion lipsync, best quality, needs 8 GB+ VRAM |
+| Lipsync (fallback) | [VideoReTalking](https://github.com/OpenTalker/video-retalking) | Robust fallback for 4–6 GB VRAM |
+| Face enhancement | [CodeFormer](https://github.com/sczhou/CodeFormer) | Face restoration & upsampling |
+| Video upscaling | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) | Blind super-resolution (4×, video mode) |
+| AV merge | ffmpeg | Audio mux & final format |
+
+## Quick Start
+
+### 1. Setup (one-time)
+
+```bash
+git clone https://github.com/ppratik2026/ailip.git
+cd ailip
+bash setup.sh
+```
+
+This will:
+- Create a `ailip` conda environment (Python 3.10 + PyTorch + CUDA)
+- Clone all vendor repos into `vendor/`
+- Download all model checkpoints
+
+### 2. Run
+
+```bash
+conda activate ailip
+
+python pipeline.py \
+  --source inputs/face.mp4 \
+  --audio  inputs/speech.wav \
+  --output outputs/result_2k.mp4
+```
+
+That's it. One command, end-to-end.
+
+## Requirements
+
+- **OS:** Linux (Ubuntu 20.04+ recommended)
+- **GPU:** NVIDIA with CUDA 11.8+
+- **VRAM:** 8 GB+ for LatentSync; 4 GB+ for VideoReTalking fallback
+- **RAM:** 16 GB+
+- **Disk:** ~15 GB (models + conda env)
+- **Software:** `conda`/`mamba`, `git`, `ffmpeg`
+
+## CLI Reference
+
+```
+python pipeline.py --help
+
+Required:
+  --source PATH       Input video (MP4/AVI/MKV) or image (JPG/PNG)
+  --audio  PATH       Input audio (WAV/MP3/AAC)
+  --output PATH       Output path (.mp4)
+
+Model selection:
+  --model  MODEL      auto | latentsync | videoretalking  (default: auto)
+  --gpu-id INT        GPU index  (default: 0)
+
+Pipeline steps:
+  --no-enhance        Skip CodeFormer face enhancement
+  --no-upscale        Skip Real-ESRGAN 2K upscaling
+
+LatentSync options:
+  --guidance-scale    Float  (default: 2.0)
+  --seed              Int    (default: 1247)
+
+CodeFormer options:
+  --fidelity          0.0–1.0  (0=max restore, 1=max fidelity, default: 0.7)
+
+Real-ESRGAN options:
+  --target-width      Int  (default: 2560)
+  --target-height     Int  (default: 1440)
+  --tile              Int  (default: 0; use 256 if GPU runs out of memory)
+  --esrgan-model      Model name  (default: RealESRGAN_x4plus)
+
+Debug:
+  --keep-temp         Keep intermediate files
+  -v / --verbose      Show debug output
+```
+
+## Examples
+
+**Image + audio → 2K lipsynced video:**
+```bash
+python pipeline.py --source face.jpg --audio speech.wav --output out.mp4
+```
+
+**Force VideoReTalking (low VRAM):**
+```bash
+python pipeline.py --source face.mp4 --audio speech.wav --output out.mp4 \
+  --model videoretalking
+```
+
+**Skip enhancement, just lipsync + upscale:**
+```bash
+python pipeline.py --source face.mp4 --audio speech.wav --output out.mp4 \
+  --no-enhance
+```
+
+**OOM on upscale? Use tiled inference:**
+```bash
+python pipeline.py --source face.mp4 --audio speech.wav --output out.mp4 \
+  --tile 256
+```
+
+**Debug — keep all intermediate files:**
+```bash
+python pipeline.py --source face.mp4 --audio speech.wav --output out.mp4 \
+  --keep-temp --verbose
+```
+
+## Directory Structure
+
+```
+ailip/
+├── pipeline.py          # Main entry point (run this)
+├── setup.sh             # One-time environment setup
+├── requirements.txt     # Python dependencies
+├── configs/
+│   └── pipeline.yaml    # Default config (editable)
+├── scripts/
+│   ├── lipsync.py       # LatentSync / VideoReTalking wrapper
+│   ├── enhance.py       # CodeFormer wrapper
+│   ├── upscale.py       # Real-ESRGAN wrapper
+│   ├── merge_av.py      # ffmpeg audio merge
+│   └── utils.py         # Shared utilities
+├── vendor/              # Cloned model repos (created by setup.sh)
+│   ├── LatentSync/
+│   ├── video-retalking/
+│   ├── CodeFormer/
+│   └── Real-ESRGAN/
+├── inputs/              # Put your source videos/images & audio here
+├── outputs/             # Pipeline outputs go here
+└── models/              # Extra model weights (if needed)
+```
+
+## Notes on Output Quality
+
+- **Flickering:** Real-ESRGAN processes video frames sequentially. For minimal flicker, avoid drastic scene cuts in source footage. Future: integrate RVRT/BasicVSR++ for true temporal-aware upscaling.
+- **Face size:** Both LatentSync and CodeFormer work best when the face occupies a significant portion of the frame. Very small faces may produce lower quality results.
+- **Audio format:** Provide clean, pre-processed audio (noise-removed WAV preferred). LatentSync uses Whisper for audio feature extraction.
+
+## Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| `CUDA out of memory` during upscale | Add `--tile 256` |
+| `CUDA out of memory` during lipsync | Use `--model videoretalking` |
+| LatentSync checkpoint not found | Re-run `bash setup.sh` |
+| ffmpeg not found | `sudo apt install ffmpeg` |
+| Conda env not activating | `source $(conda info --base)/etc/profile.d/conda.sh && conda activate ailip` |
+
+## License
+
+This pipeline is MIT licensed. Each vendor model has its own license:
+- LatentSync: Apache 2.0
+- VideoReTalking: MIT
+- CodeFormer: S-Lab License 1.0
+- Real-ESRGAN: BSD 3-Clause

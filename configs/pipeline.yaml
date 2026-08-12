@@ -1,0 +1,28 @@
+# AiLip Pipeline Default Configuration
+# Override any value via CLI flags (CLI takes precedence).
+
+lipsync:
+  model: auto                # auto | latentsync | videoretalking
+  guidance_scale: 2.0        # LatentSync only
+  seed: 1247                 # LatentSync only
+  vram_threshold_gb: 8.0     # VRAM needed to use LatentSync
+
+enhance:
+  enabled: true
+  fidelity_weight: 0.7       # 0 = max restoration, 1 = max fidelity
+  face_upsample: true
+  bg_tile: 400               # Background tile size (px)
+
+upscale:
+  enabled: true
+  target_width: 2560
+  target_height: 1440
+  model: RealESRGAN_x4plus
+  tile: 0                    # 0 = no tiling; use 256 if GPU OOM
+  face_enhance: false        # Use Real-ESRGAN's built-in face enhance
+                             # (set true only if skipping CodeFormer)
+
+output:
+  crf: 16                    # H.264 quality (lower = better, 16-18 recommended)
+  audio_bitrate: "192k"
+  preset: slow               # x264 preset: ultrafast → veryslow

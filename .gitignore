@@ -1,0 +1,43 @@
+# Vendor repos (cloned by setup.sh)
+vendor/
+
+# Outputs & inputs (user files)
+outputs/*.mp4
+outputs/*.avi
+inputs/*.mp4
+inputs/*.avi
+inputs/*.wav
+inputs/*.mp3
+inputs/*.jpg
+inputs/*.png
+
+# Models
+models/*.pth
+models/*.pt
+models/*.ckpt
+models/*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Conda / pip
+.venv/
+env/
+
+# Temp / debug
+tmp_*/
+ailip_*/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
