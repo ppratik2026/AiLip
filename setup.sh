@@ -281,17 +281,27 @@ if ! $SKIP_VRT; then
     warn "VideoReTalking checkpoints already present."
   else
     info "Downloading VideoReTalking checkpoints from HuggingFace..."
-    python - << PYEOF
+    python - << 'PYEOF' || {
+      warn "VideoReTalking checkpoint download failed (repo may be private/moved). VRT will be unavailable; LatentSync will be used."
+      SKIP_VRT=true
+    }
+import sys
 from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="vinthony/video-retalking",
-    local_dir="$VRT_CKPT_DIR",
-    ignore_patterns=["*.md"],
-)
-print("  VideoReTalking checkpoints downloaded.")
+try:
+    snapshot_download(
+        repo_id="vinthony/video-retalking",
+        local_dir="$VRT_CKPT_DIR",
+        ignore_patterns=["*.md"],
+    )
+    print("  VideoReTalking checkpoints downloaded.")
+except Exception as e:
+    print(f"  Download failed: {e}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
   fi
-  info "VideoReTalking ready ✓"
+  if ! $SKIP_VRT; then
+    info "VideoReTalking ready ✓"
+  fi
 fi  # SKIP_VRT
 
 # ── CodeFormer ────────────────────────────────────────────────────────────────
