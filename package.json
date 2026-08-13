@@ -1,0 +1,11 @@
+{
+  "name": "ailip",
+  "version": "1.0.0",
+  "description": "AiLip — AI Lipsync Webapp",
+  "scripts": {
+    "start": "pip install -r webapp/requirements.txt && gunicorn --chdir webapp app:app --bind 0.0.0.0:${PORT:-3000} --timeout 7200 --workers 2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
