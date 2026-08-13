@@ -95,9 +95,34 @@ else
 fi
 info "Using: $CONDA_CMD"
 
-CONDA_BASE=$($CONDA_CMD info --base)
-# shellcheck disable=SC1091
-source "$CONDA_BASE/etc/profile.d/conda.sh"
+CONDA_BASE=$($CONDA_CMD info --base 2>/dev/null || echo "")
+
+# Find conda.sh — path varies by OS/image (Vast.ai, RunPod, local conda, miniforge, etc.)
+_find_conda_sh() {
+  local candidates=(
+    "$CONDA_BASE/etc/profile.d/conda.sh"
+    "/opt/conda/etc/profile.d/conda.sh"
+    "/opt/miniforge3/etc/profile.d/conda.sh"
+    "/opt/mamba/etc/profile.d/conda.sh"
+    "$HOME/miniconda3/etc/profile.d/conda.sh"
+    "$HOME/miniforge3/etc/profile.d/conda.sh"
+    "$HOME/anaconda3/etc/profile.d/conda.sh"
+  )
+  for p in "${candidates[@]}"; do
+    [[ -f "$p" ]] && echo "$p" && return 0
+  done
+  # Last resort: find it
+  find /opt /root /home /usr -maxdepth 6 -name "conda.sh" -path "*/profile.d/*" 2>/dev/null | head -1
+}
+
+CONDA_SH=$(_find_conda_sh)
+if [[ -z "$CONDA_SH" ]]; then
+  # conda may already be initialised in this shell (Vast.ai/RunPod base images)
+  warn "conda.sh not found — assuming conda is already active in this shell."
+else
+  # shellcheck disable=SC1090
+  source "$CONDA_SH"
+fi
 
 if conda env list | grep -qE "^${ENV_NAME}\s"; then
   warn "Conda env '${ENV_NAME}' already exists — reusing."
@@ -378,8 +403,11 @@ WORKERS="${WORKERS:-1}"      # keep 1 — GPU is shared, threading handles concu
 
 # Activate conda env
 CONDA_BASE="$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")"
-# shellcheck disable=SC1091
-source "$CONDA_BASE/etc/profile.d/conda.sh"
+_CONDA_SH=""
+for _p in "$CONDA_BASE/etc/profile.d/conda.sh" /opt/conda/etc/profile.d/conda.sh /opt/miniforge3/etc/profile.d/conda.sh "$HOME/miniconda3/etc/profile.d/conda.sh"; do
+  [[ -f "$_p" ]] && _CONDA_SH="$_p" && break
+done
+[[ -n "$_CONDA_SH" ]] && source "$_CONDA_SH" || true
 conda activate ailip
 
 # Make vendor modules importable
