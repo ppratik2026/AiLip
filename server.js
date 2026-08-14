@@ -11,7 +11,7 @@ try {
 
 console.log(`[AiLip] Starting Flask on port ${PORT}...`);
 const proc = spawn('python', ['-m', 'gunicorn', '--chdir', 'webapp', 'app:app',
-  `--bind=0.0.0.0:${PORT}`, '--timeout=7200', '--workers=2'
+  `--bind=0.0.0.0:${PORT}`, '--timeout=7200', '--workers=1'
 ], { stdio: 'inherit', shell: false });
 
 proc.on('exit', code => process.exit(code));
