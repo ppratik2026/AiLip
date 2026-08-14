@@ -281,10 +281,7 @@ if ! $SKIP_VRT; then
     warn "VideoReTalking checkpoints already present."
   else
     info "Downloading VideoReTalking checkpoints from HuggingFace..."
-    python - << 'PYEOF' || {
-      warn "VideoReTalking checkpoint download failed (repo may be private/moved). VRT will be unavailable; LatentSync will be used."
-      SKIP_VRT=true
-    }
+    python - << 'PYEOF'
 import sys
 from huggingface_hub import snapshot_download
 try:
@@ -298,6 +295,10 @@ except Exception as e:
     print(f"  Download failed: {e}", file=sys.stderr)
     sys.exit(1)
 PYEOF
+    if [[ $? -ne 0 ]]; then
+      warn "VideoReTalking checkpoint download failed (repo may be private/moved). VRT unavailable; LatentSync will be used."
+      SKIP_VRT=true
+    fi
   fi
   if ! $SKIP_VRT; then
     info "VideoReTalking ready ✓"
