@@ -34,7 +34,7 @@ def run_latentsync(
             f"LatentSync checkpoint not found at {ckpt}. Run setup.sh."
         )
 
-    unet_cfg = LATENTSYNC_DIR / "configs" / "unet" / "second_stage.yaml"
+    unet_cfg = LATENTSYNC_DIR / "configs" / "unet" / "stage2.yaml"
 
     cmd = [
         sys.executable, "-m", "scripts.inference",
